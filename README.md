@@ -1,0 +1,2 @@
+# pytorch_trainer
+My little effort to write a trainer class for PyTorch models. This project started out as a way to solve my issue with `pytorch_lightning`, which failed to compute metrics accurately. Currently it is in no way a replacement for neither `pytorch_lightning` nor `fastai`, but the interface is somewhat based on both. My goal is to keep the implementation as simple as possible to make it easy to take it as a snippet and customise.
