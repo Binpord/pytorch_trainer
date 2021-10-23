@@ -57,15 +57,15 @@ class TrainableModel(Module):
     def __init__(
         self,
         model: Module,
-        train_dataset: Dataset,
-        val_dataset: Dataset,
         criterion: _Loss,
+        train_dataset: Dataset,
+        val_dataset: Optional[Dataset] = None,
     ) -> None:
         super().__init__()
         self.model = model
+        self.criterion = criterion
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        self.criterion = criterion
         self.trainer = None
 
     def forward(self, x: Tensor) -> Tensor:
@@ -90,8 +90,11 @@ class TrainableModel(Module):
             shuffle=True,
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self) -> Optional[DataLoader]:
         assert self.trainer is not None
+        if self.val_dataset is None:
+            return None
+
         return DataLoader(
             self.val_dataset,
             batch_size=self.trainer.batch_size,
@@ -116,15 +119,17 @@ class Trainer:
         self,
         model: TrainableModel,
         batch_size: int,
-        device: torch.device,
-        logger: Optional[Logger] = None,
         metrics: Optional[List[Metric]] = None,
+        gpu_number: int = 0,
+        logger: Optional[Logger] = None,
     ) -> None:
         self.model = model
         self.batch_size = batch_size
-        self.device = device
-        self.logger = logger or PrintLogger()
         self.metrics = metrics or []
+        self.device = torch.device(
+            f"cuda:{gpu_number}" if torch.cuda.is_available() else "cpu"
+        )
+        self.logger = logger or PrintLogger()
 
         self.model.to(self.device)
         self.model.trainer = self
@@ -142,6 +147,10 @@ class Trainer:
         self.optimizer, self.scheduler = self.model.configure_optimizers()
         for epoch in range(self.epochs):
             self.training_epoch()
+
+            # Validate if the validation dataset is available.
+            if self.val_dataloader is None:
+                continue
 
             with torch.no_grad():
                 val_loss, metric_values = self.validation_epoch()
@@ -185,6 +194,7 @@ class Trainer:
         end_value: float = 10.0,
         steps: int = 100,
         beta: float = 0.98,
+        early_stop: bool = True,
     ) -> Tuple[List[float], List[float]]:
         self.save_model()
 
@@ -216,7 +226,7 @@ class Trainer:
             smooth_loss = average_loss / (1 - beta ** step)
             if step == 1 or smooth_loss < best_loss:
                 best_loss = smooth_loss
-            elif step > 1 and smooth_loss > 4 * best_loss:
+            elif early_stop and step > 1 and smooth_loss > 4 * best_loss:
                 break
 
             learning_rate_history.append(self.optimizer.param_groups[0]["lr"])
