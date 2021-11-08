@@ -53,89 +53,31 @@ class Accuracy(Metric):
         self.total = 0
 
 
-class TrainableModel(Module):
+class Trainer:
     def __init__(
         self,
         model: Module,
         criterion: _Loss,
+        batch_size: int,
         train_dataset: Dataset,
         val_dataset: Optional[Dataset] = None,
-    ) -> None:
-        super().__init__()
-        self.model = model
-        self.criterion = criterion
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.trainer = None
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.model(x)
-
-    def training_step(self, input: Tensor, target: Tensor) -> Tensor:
-        prediction = self(input)
-        loss = self.criterion(prediction, target)
-        return loss
-
-    def validation_step(self, input, target) -> Tuple[Tensor, Tensor]:
-        prediction = self(input)
-        loss = self.criterion(prediction, target)
-        return loss, prediction
-
-    def train_dataloader(self) -> DataLoader:
-        assert self.trainer is not None
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.trainer.batch_size,
-            num_workers=os.cpu_count(),
-            shuffle=True,
-        )
-
-    def val_dataloader(self) -> Optional[DataLoader]:
-        assert self.trainer is not None
-        if self.val_dataset is None:
-            return None
-
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.trainer.batch_size,
-            num_workers=os.cpu_count(),
-            shuffle=True,
-        )
-
-    def configure_optimizers(self) -> Tuple[Optimizer, _LRScheduler]:
-        assert self.trainer is not None
-        optimizer = torch.optim.AdamW(self.parameters(), self.trainer.learning_rate)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            self.trainer.learning_rate,
-            epochs=self.trainer.epochs,
-            steps_per_epoch=len(self.trainer.train_dataloader),
-        )
-        return optimizer, scheduler
-
-
-class Trainer:
-    def __init__(
-        self,
-        model: TrainableModel,
-        batch_size: int,
         metrics: Optional[List[Metric]] = None,
         gpu_number: int = 0,
         logger: Optional[Logger] = None,
     ) -> None:
         self.model = model
+        self.criterion = criterion
         self.batch_size = batch_size
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
         self.metrics = metrics or []
         self.device = torch.device(
             f"cuda:{gpu_number}" if torch.cuda.is_available() else "cpu"
         )
         self.logger = logger or PrintLogger()
 
+        self.configure_dataloaders()
         self.model.to(self.device)
-        self.model.trainer = self
-        self.train_dataloader = self.model.train_dataloader()
-        self.val_dataloader = self.model.val_dataloader()
-
         self.epochs = None
         self.learning_rate = None
         self.optimizer = None
@@ -144,7 +86,7 @@ class Trainer:
     def fit(self, epochs: int = 10, learning_rate: float = 1e-3) -> None:
         self.epochs = epochs
         self.learning_rate = learning_rate
-        self.optimizer, self.scheduler = self.model.configure_optimizers()
+        self.configure_optimizers()
         for epoch in range(self.epochs):
             self.training_epoch()
 
@@ -166,9 +108,14 @@ class Trainer:
         self.model.train()
         for input, target in self.train_dataloader:
             input, target = input.to(self.device), target.to(self.device)
-            loss = self.model.training_step(input, target)
+            loss = self.training_step(input, target)
             self.optimization_step(loss)
             self.logger.log({"train_loss": loss.item()})
+
+    def training_step(self, input: Tensor, target: Tensor) -> Tensor:
+        prediction = self.model(input)
+        loss = self.criterion(prediction, target)
+        return loss
 
     def optimization_step(self, loss: Tensor) -> None:
         self.optimizer.zero_grad()
@@ -182,11 +129,44 @@ class Trainer:
         val_loss = 0
         for input, target in self.val_dataloader:
             input, target = input.to(self.device), target.to(self.device)
-            loss, prediction = self.model.validation_step(input, target)
+            loss, prediction = self.validation_step(input, target)
             val_loss += loss.item()
             self.update_metrics(prediction, target)
 
         return val_loss / len(self.val_dataloader), self.compute_metrics()
+
+    def validation_step(self, input, target) -> Tuple[Tensor, Tensor]:
+        prediction = self.model(input)
+        loss = self.criterion(prediction, target)
+        return loss, prediction
+
+    def configure_dataloaders(self) -> None:
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=os.cpu_count(),
+            shuffle=True,
+        )
+
+        if self.val_dataset is None:
+            self.val_dataloader = None
+            return
+
+        self.val_dataloader = DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=os.cpu_count(),
+            shuffle=True,
+        )
+
+    def configure_optimizers(self) -> None:
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), self.learning_rate)
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            self.learning_rate,
+            epochs=self.epochs,
+            steps_per_epoch=len(self.train_dataloader),
+        )
 
     def find_learning_rate(
         self,
@@ -217,7 +197,7 @@ class Trainer:
                 input, target = next(train_dataloader)
 
             step += 1
-            loss = self.model.training_step(
+            loss = self.training_step(
                 input.to(self.device), target.to(self.device)
             )
 
