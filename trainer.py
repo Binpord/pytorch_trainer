@@ -7,8 +7,6 @@ from typing import Tuple, List, Dict, Optional, Any
 from torch import Tensor
 from torch.nn import Module
 from torch.nn.modules.loss import _Loss
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -156,7 +154,7 @@ class Trainer:
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=os.cpu_count(),
-            shuffle=True,
+            shuffle=False,
         )
 
     def configure_optimizers(self) -> None:
