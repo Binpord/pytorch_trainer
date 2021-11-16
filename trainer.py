@@ -1,7 +1,9 @@
 import os
 
+import matplotlib.pyplot as plt
 import torch
 
+from dataclasses import dataclass
 from typing import Tuple, List, Dict, Optional, Any
 
 from torch import Tensor
@@ -51,6 +53,26 @@ class Accuracy(Metric):
         self.total = 0
 
 
+@dataclass
+class LearningRateFinderResults:
+    learning_rate_history: List[float]
+    loss_history: List[float]
+
+    def plot_results(
+        self, n_skip_last: Optional[int] = None, ax: Optional[plt.Axes] = None
+    ) -> plt.Axes:
+        if ax is None:
+            ax = plt.gca()
+
+        slice_stop = -n_skip_last if n_skip_last is not None else None
+        ax.plot(
+            self.learning_rate_history[:slice_stop],
+            self.loss_history[:slice_stop],
+        )
+        ax.set_xscale("log")
+        return ax
+
+
 class Trainer:
     def __init__(
         self,
@@ -76,16 +98,16 @@ class Trainer:
 
         self.configure_dataloaders()
         self.model.to(self.device)
-        self.epochs = None
+        self.n_epochs = None
         self.learning_rate = None
         self.optimizer = None
         self.scheduler = None
 
-    def fit(self, epochs: int = 10, learning_rate: float = 1e-3) -> None:
-        self.epochs = epochs
+    def fit(self, n_epochs: int = 10, learning_rate: float = 1e-3) -> None:
+        self.n_epochs = n_epochs
         self.learning_rate = learning_rate
         self.configure_optimizers()
-        for epoch in range(self.epochs):
+        for epoch in range(self.n_epochs):
             self.training_epoch()
 
             # Validate if the validation dataset is available.
@@ -162,7 +184,7 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             self.learning_rate,
-            epochs=self.epochs,
+            epochs=self.n_epochs,
             steps_per_epoch=len(self.train_dataloader),
         )
 
@@ -170,13 +192,13 @@ class Trainer:
         self,
         start_value: float = 1e-7,
         end_value: float = 10.0,
-        steps: int = 100,
+        n_steps: int = 100,
         beta: float = 0.98,
         early_stop: bool = True,
-    ) -> Tuple[List[float], List[float]]:
+    ) -> LearningRateFinderResults:
         self.save_model()
 
-        gamma = (end_value / start_value) ** (1 / steps)
+        gamma = (end_value / start_value) ** (1 / n_steps)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=start_value)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma)
         self.model.train()
@@ -185,26 +207,22 @@ class Trainer:
         average_loss = 0.0
         best_loss = None
         train_dataloader = iter(self.train_dataloader)
-        step = 0
-        while step < steps + 1:
-            # In case of len(train_dataloader) < steps.
+        for step in range(n_steps):
+            # In case of len(train_dataloader) < n_steps.
             try:
                 input, target = next(train_dataloader)
             except StopIteration:
                 train_dataloader = iter(self.train_dataloader)
                 input, target = next(train_dataloader)
 
-            step += 1
-            loss = self.training_step(
-                input.to(self.device), target.to(self.device)
-            )
+            loss = self.training_step(input.to(self.device), target.to(self.device))
 
             # Apply exponential smoothing.
             average_loss = average_loss * beta + loss.item() * (1 - beta)
-            smooth_loss = average_loss / (1 - beta ** step)
-            if step == 1 or smooth_loss < best_loss:
+            smooth_loss = average_loss / (1 - beta ** (step + 1))
+            if step == 0 or smooth_loss < best_loss:
                 best_loss = smooth_loss
-            elif early_stop and step > 1 and smooth_loss > 4 * best_loss:
+            elif early_stop and step > 0 and smooth_loss > 4 * best_loss:
                 break
 
             learning_rate_history.append(self.optimizer.param_groups[0]["lr"])
@@ -213,7 +231,7 @@ class Trainer:
             self.optimization_step(loss)
 
         self.load_model()
-        return learning_rate_history, loss_history
+        return LearningRateFinderResults(learning_rate_history, loss_history)
 
     def save_model(self, path="model.pth") -> None:
         torch.save(self.model.state_dict(), path)
