@@ -8,6 +8,8 @@ from typing import Tuple, List, Dict, Optional, Any
 
 from torch import Tensor
 from torch.nn import Module
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import _LRScheduler
 from torch.nn.modules.loss import _Loss
 from torch.utils.data import Dataset, DataLoader
 
@@ -53,6 +55,34 @@ class Accuracy(Metric):
         self.total = 0
 
 
+class TrainableModel(Module):
+    def __init__(self, criterion: _Loss) -> None:
+        super().__init__()
+        self.criterion = criterion
+
+    def training_step(self, input: Tensor, target: Tensor) -> Tensor:
+        prediction = self(input)
+        loss = self.criterion(prediction, target)
+        return loss
+
+    def validation_step(self, input, target) -> Tuple[Tensor, Tensor]:
+        prediction = self(input)
+        loss = self.criterion(prediction, target)
+        return loss, prediction
+
+    def configure_optimizers(
+        self, learning_rate: float, n_epochs: int, steps_per_epoch: int
+    ) -> Tuple[Optimizer, _LRScheduler]:
+        optimizer = torch.optim.AdamW(self.parameters(), learning_rate)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            learning_rate,
+            epochs=n_epochs,
+            steps_per_epoch=steps_per_epoch,
+        )
+        return optimizer, scheduler
+
+
 @dataclass
 class LearningRateFinderResults:
     learning_rate_history: List[float]
@@ -60,7 +90,7 @@ class LearningRateFinderResults:
 
     def plot_results(
         self, n_skip_last: Optional[int] = None, ax: Optional[plt.Axes] = None
-    ) -> plt.Axes:
+    ) -> None:
         if ax is None:
             ax = plt.gca()
 
@@ -70,44 +100,39 @@ class LearningRateFinderResults:
             self.loss_history[:slice_stop],
         )
         ax.set_xscale("log")
-        return ax
 
 
 class Trainer:
     def __init__(
         self,
-        model: Module,
-        criterion: _Loss,
-        batch_size: int,
+        model: TrainableModel,
         train_dataset: Dataset,
         val_dataset: Optional[Dataset] = None,
+        batch_size: int = 64,
+        n_workers: Optional[int] = None,
         metrics: Optional[List[Metric]] = None,
         gpu_number: int = 0,
         logger: Optional[Logger] = None,
     ) -> None:
         self.model = model
-        self.criterion = criterion
-        self.batch_size = batch_size
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
         self.metrics = metrics or []
         self.device = torch.device(
             f"cuda:{gpu_number}" if torch.cuda.is_available() else "cpu"
         )
         self.logger = logger or PrintLogger()
 
-        self.configure_dataloaders()
+        self.train_dataloader, self.val_dataloader = self.configure_dataloaders(
+            train_dataset, val_dataset, batch_size, n_workers
+        )
         self.model.to(self.device)
-        self.n_epochs = None
-        self.learning_rate = None
         self.optimizer = None
         self.scheduler = None
 
-    def fit(self, n_epochs: int = 10, learning_rate: float = 1e-3) -> None:
-        self.n_epochs = n_epochs
-        self.learning_rate = learning_rate
-        self.configure_optimizers()
-        for epoch in range(self.n_epochs):
+    def train_model(self, n_epochs: int = 10, learning_rate: float = 1e-3) -> None:
+        self.optimizer, self.scheduler = self.model.configure_optimizers(
+            learning_rate, n_epochs, steps_per_epoch=len(self.train_dataloader)
+        )
+        for epoch in range(n_epochs):
             self.training_epoch()
 
             # Validate if the validation dataset is available.
@@ -128,14 +153,9 @@ class Trainer:
         self.model.train()
         for input, target in self.train_dataloader:
             input, target = input.to(self.device), target.to(self.device)
-            loss = self.training_step(input, target)
+            loss = self.model.training_step(input, target)
             self.optimization_step(loss)
             self.logger.log({"train_loss": loss.item()})
-
-    def training_step(self, input: Tensor, target: Tensor) -> Tensor:
-        prediction = self.model(input)
-        loss = self.criterion(prediction, target)
-        return loss
 
     def optimization_step(self, loss: Tensor) -> None:
         self.optimizer.zero_grad()
@@ -149,44 +169,39 @@ class Trainer:
         val_loss = 0
         for input, target in self.val_dataloader:
             input, target = input.to(self.device), target.to(self.device)
-            loss, prediction = self.validation_step(input, target)
+            loss, prediction = self.model.validation_step(input, target)
             val_loss += loss.item()
             self.update_metrics(prediction, target)
 
         return val_loss / len(self.val_dataloader), self.compute_metrics()
 
-    def validation_step(self, input, target) -> Tuple[Tensor, Tensor]:
-        prediction = self.model(input)
-        loss = self.criterion(prediction, target)
-        return loss, prediction
+    def configure_dataloaders(
+        self,
+        train_dataset: Dataset,
+        val_dataset: Optional[Dataset] = None,
+        batch_size: int = 64,
+        n_workers: Optional[int] = None,
+    ) -> Tuple[DataLoader, Optional[DataLoader]]:
+        if n_workers is None:
+            n_workers = os.cpu_count()
 
-    def configure_dataloaders(self) -> None:
-        self.train_dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=os.cpu_count(),
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size,
             shuffle=True,
+            num_workers=n_workers,
         )
 
-        if self.val_dataset is None:
-            self.val_dataloader = None
-            return
+        val_dataloader = None
+        if val_dataset is not None:
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size,
+                shuffle=False,
+                num_workers=n_workers,
+            )
 
-        self.val_dataloader = DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=os.cpu_count(),
-            shuffle=False,
-        )
-
-    def configure_optimizers(self) -> None:
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), self.learning_rate)
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            self.learning_rate,
-            epochs=self.n_epochs,
-            steps_per_epoch=len(self.train_dataloader),
-        )
+        return train_dataloader, val_dataloader
 
     def find_learning_rate(
         self,
@@ -215,7 +230,9 @@ class Trainer:
                 train_dataloader = iter(self.train_dataloader)
                 input, target = next(train_dataloader)
 
-            loss = self.training_step(input.to(self.device), target.to(self.device))
+            loss = self.model.training_step(
+                input.to(self.device), target.to(self.device)
+            )
 
             # Apply exponential smoothing.
             average_loss = average_loss * beta + loss.item() * (1 - beta)
